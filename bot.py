@@ -1,3 +1,4 @@
+import gc
 import math
 import os
 import random
@@ -8,8 +9,10 @@ import mechfight as mf
 
 try:
     from world import World
-except Exception:  # numpy missing etc.
+    _WORLD_ERR = None
+except Exception as _e:  # numpy missing etc.
     World = None
+    _WORLD_ERR = repr(_e)
 
 PI = math.pi
 TAU = 2 * math.pi
@@ -64,6 +67,10 @@ HEAL_EXIT = float(os.environ.get("MF_HEAL_EXIT", "0.8"))
 CAMP = os.environ.get("MF_CAMP", "0") == "1"
 STYLE = os.environ.get("MF_STYLE", "roam")  # auto: camp until the match looks like a free-for-all
 HEAL_HOLD = os.environ.get("MF_HEAL_HOLD", "1") == "1"
+# ---- latency guard (sub 1): a soft per-tick deadline that the expensive searches respect
+TICK_BUDGET_S = float(os.environ.get("MF_TICK_BUDGET_MS", "15")) / 1000.0
+ASTAR_BUDGET_S = float(os.environ.get("MF_ASTAR_MS", "6")) / 1000.0
+STATS_EVERY = 300
 
 
 def wrap(a):
@@ -87,6 +94,10 @@ class Bot:
         self.slot = hello.get("slot", 0)
         random.seed(hello.get("seed", 0))
         self.world = None
+        self.deadline = 1e18
+        self.dts = []
+        if World is None:
+            log("WORLD FAILED (import):", _WORLD_ERR)
         if World is not None:
             try:
                 d = hello.get("map", {}).get("dir") or "/arena"
@@ -94,8 +105,9 @@ class Bot:
                     here = os.path.dirname(os.path.abspath(__file__))
                     d = f"{here}/arena"
                 self.world = World(d)
+                log(f"WORLD OK from {d}: nav {self.world.NW}x{self.world.NH}")
             except Exception as e:  # never die on map trouble
-                log("world load failed:", repr(e))
+                log("WORLD FAILED (load):", repr(e))
                 self.world = None
         w = cfg["weapons"]
         self.gun_cfg = w["gun"]
@@ -165,6 +177,12 @@ class Bot:
         self.last_threat_t = -99
         self.attacks = []
         self.dmg_by = None
+        # the big world arrays live forever: keep the cyclic GC from rescanning them mid-match
+        gc.collect()
+        gc.freeze()
+
+    def time_left(self):
+        return self.deadline - time.perf_counter()
 
     # ------------------------------------------------------------------ helpers
     def zone_at(self, z, t):
@@ -235,6 +253,7 @@ class Bot:
     # ------------------------------------------------------------------ main
     def act(self, obs):
         t0 = time.perf_counter()
+        self.deadline = t0 + TICK_BUDGET_S
         self.t = obs["t"]
         me = self.me = obs["self"]
         self.obs = obs
@@ -305,8 +324,14 @@ class Bot:
             act.pop("take", None)
         dt = time.perf_counter() - t0
         self.maxdt = max(self.maxdt, dt)
-        if self.ticks % 300 == 0:
-            log(f"t={self.t:.0f} hp={me['hp']:.0f} maxdt={self.maxdt * 1000:.1f}ms")
+        self.dts.append(dt)
+        if self.ticks % STATS_EVERY == 0:
+            ds = sorted(self.dts)
+            n = len(ds)
+            log(f"t={self.t:.0f} hp={me['hp']:.0f} world={'on' if self.world is not None else 'OFF'} "
+                f"tick ms p50={ds[n // 2] * 1000:.1f} p99={ds[min(n - 1, int(n * 0.99))] * 1000:.1f} "
+                f"max={ds[-1] * 1000:.1f} (match max {self.maxdt * 1000:.1f})")
+            self.dts = []
         return act
 
     # ------------------------------------------------------------------ events
@@ -759,8 +784,9 @@ class Bot:
             return math.atan2(goal[1] - pos[1], goal[0] - pos[0])
         need = force or self.path is None or self.path_goal is None or \
             math.dist(goal[:2], self.path_goal) > 6 or self.t - self.path_t > 2.5
-        if need:
-            r = w.astar(pos[0], pos[1], goal[0], goal[1], max_exp=4000)
+        if need and (self.path is None or self.time_left() > 0.002):
+            budget = max(0.0005, min(ASTAR_BUDGET_S, self.time_left()))
+            r = w.astar(pos[0], pos[1], goal[0], goal[1], max_exp=4000, budget_s=budget)
             self.path_t = self.t
             self.path_goal = (goal[0], goal[1])
             self.path = r[0] if r else None
@@ -798,6 +824,8 @@ class Bot:
         best = None
         tl = threats[:3]
         for r in (9, 17, 26, 36):
+            if self.time_left() < 0.001 and (best is not None or r > 9):
+                break
             for k in range(16):
                 a = k * TAU / 16
                 x = pos[0] + r * math.cos(a)
@@ -1403,6 +1431,8 @@ class Bot:
             return self.duck
         best = None
         for r in (4.0, 7.0, 9.5):
+            if self.time_left() < 0.001 and r > 4.0:
+                break
             for k in range(12):
                 a = k * TAU / 12
                 x, y = pos[0] + r * math.cos(a), pos[1] + r * math.sin(a)
