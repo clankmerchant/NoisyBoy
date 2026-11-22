@@ -9,6 +9,7 @@ TAU = math.tau
 UP_PREF = ["armor", "plating", "gun_damage", "gun_rate", "servos", "laser_damage", "laser_charge", "nanites", "gyros", "capacitor", "sensors", "reactor", "jets", "laser_damage", "laser_charge",
            "gun_mag", "gun_velocity", "lightning_range"]
 WEAPON_RANK = {"laser": 2}
+RUNNER = True  # experiment: no fighting, no looting, just flee and hold the zone edge
 
 
 def norm_ang(a):
@@ -21,7 +22,7 @@ def unit(dx, dy):
 
 
 class Bot:
-    name = "aggro-1"
+    name = "runner-1"
 
     def __init__(self, hello):
         self.rng = random.Random(hello.get("seed", 1))
@@ -244,15 +245,15 @@ class Bot:
         if target is None:
             for n in npcs:
                 nd = math.hypot(n["pos"][0] - x, n["pos"][1] - y)
-                if nd < 60 and hp_frac > 0.4:
+                if (not RUNNER) and nd < 60 and hp_frac > 0.4:
                     n["d"] = nd
                     target, tkind = n, "npc"
                     break
 
         # ---- aggression plan: 1v1 engage at long range, retreat-while-shooting if not isolated
         n_all = len([m for m in mechs if m["d"] < 220])
-        engage_ok = (not virtual) and tkind == "mech" and n_all == 1 and hp_frac > 0.35 and t < 300
-        npc_fight = tkind == "npc" and not threats
+        engage_ok = (not RUNNER) and (not virtual) and tkind == "mech" and n_all == 1 and hp_frac > 0.35 and t < 300
+        npc_fight = (not RUNNER) and tkind == "npc" and not threats
         edge_r = max(R * 0.8, min(R, 15.0))
         ex, ey = unit(x - C[0], y - C[1]) if dC > 1 else (1.0, 0.0)
         edge_pt = (C[0] + ex * edge_r, C[1] + ey * edge_r)
@@ -306,7 +307,12 @@ class Bot:
                 cxu, cyu = unit(C[0] - x, C[1] - y)
                 mx, my = mx + cxu * 0.6, my + cyu * 0.6
             move = self.free_dir(x, y, *unit(mx, my), 12.0)
-            boost = goal_label == "retreat" and d < 100 or (goal_label == "duel" and d > 140)
+            boost = goal_label == "retreat" or (goal_label == "duel" and d > 140)
+        elif RUNNER:
+            goal_label = "edge"
+            if dC > edge_r * 1.1 or dC < edge_r * 0.7:
+                move, _ = self.go_to(pos, edge_pt, tick)
+                move = (move[0] * 0.8, move[1] * 0.8)
         else:
             # ---- loot / objectives
             goal = None
