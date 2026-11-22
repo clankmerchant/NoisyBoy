@@ -197,7 +197,9 @@ class World:
                 return best[1]
         return -1
 
-    def plan(self, sx, sy, gx, gy, maxexp=4000):
+    def plan(self, sx, sy, gx, gy, maxexp=2500, budget=0.012):
+        import time
+        tstart = time.perf_counter()
         s = self.nearest_free(self.ci(sx, sy))
         g = self.nearest_free(self.ci(gx, gy))
         if s < 0 or g < 0:
@@ -225,6 +227,8 @@ class World:
                 best = (0, c)
                 break
             exp += 1
+            if (exp & 127) == 0 and time.perf_counter() - tstart > budget:
+                break
             cy, cx = divmod(c, W)
             gc = gs[c]
             for dx, dy, cost in ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
