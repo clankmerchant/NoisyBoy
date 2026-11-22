@@ -6,10 +6,9 @@ import mechfight as mf
 from world import World
 
 TAU = math.tau
-UP_PREF = ["armor", "plating", "nanites", "servos", "lightning_efficiency", "gun_damage", "lightning_chain",
-           "gun_rate", "gyros", "capacitor", "sensors", "reactor", "jets", "laser_damage", "laser_charge",
+UP_PREF = ["armor", "plating", "gun_damage", "gun_rate", "servos", "laser_damage", "laser_charge", "nanites", "gyros", "capacitor", "sensors", "reactor", "jets", "laser_damage", "laser_charge",
            "gun_mag", "gun_velocity", "lightning_range"]
-WEAPON_RANK = {"lightning": 3, "laser": 2}
+WEAPON_RANK = {"laser": 2}
 
 
 def norm_ang(a):
@@ -22,7 +21,7 @@ def unit(dx, dy):
 
 
 class Bot:
-    name = "survivor-1"
+    name = "aggro-1"
 
     def __init__(self, hello):
         self.rng = random.Random(hello.get("seed", 1))
@@ -51,6 +50,7 @@ class Bot:
         self.cover_tick = -999
         self.strafe = 1
         self.strafe_flip = 0
+        self.strafe_mag = 1.0
         self.last_dmg_t = -99
         self.last_dmg_bearing = 0.0
         self.last_threat_t = -99
@@ -249,70 +249,64 @@ class Bot:
                     target, tkind = n, "npc"
                     break
 
-        # ---- fight or hide
-        has_lightning = "lightning" in have
-        fight = False
-        if tkind == "mech" and not virtual:
-            near = [m for m in mechs if m["d"] < 100]
-            if has_lightning and target["d"] < 60 and len(near) <= 2 and hp_frac > 0.4 and me["energy"] > 25:
-                fight = True
-            elif len(near) <= 1 and hp_frac > 0.65 and target.get("hp", 1000) <= me["hp"] * 1.2:
-                fight = True
-        elif tkind == "npc":
-            fight = True
+        # ---- aggression plan: 1v1 engage at long range, retreat-while-shooting if not isolated
+        n_all = len([m for m in mechs if m["d"] < 220])
+        engage_ok = (not virtual) and tkind == "mech" and n_all == 1 and hp_frac > 0.35 and t < 300
+        npc_fight = tkind == "npc" and not threats
+        edge_r = max(R * 0.8, min(R, 15.0))
+        ex, ey = unit(x - C[0], y - C[1]) if dC > 1 else (1.0, 0.0)
+        edge_pt = (C[0] + ex * edge_r, C[1] + ey * edge_r)
+        out_zone = (not me["in_zone"]) or math.hypot(x - cC[0], y - cC[1]) > cR - 6
+
+        if t > self.strafe_flip:
+            self.strafe = -self.strafe
+            self.strafe_flip = t + 0.4 + self.rng.random() * 0.7
+            self.strafe_mag = 0.75 + self.rng.random() * 0.25
 
         move = (0.0, 0.0)
         boost = False
         goal_label = ""
         loot_goal = None
 
-        if zone_unsafe:
-            tx = C[0] + (x - C[0]) / max(dC, 1) * safe_r * 0.6 if dC > 1 else C[0]
-            ty = C[1] + (y - C[1]) / max(dC, 1) * safe_r * 0.6 if dC > 1 else C[1]
-            move, _ = self.go_to(pos, (tx, ty), tick)
+        if out_zone:
+            move, _ = self.go_to(pos, edge_pt, tick)
             boost = True
             goal_label = "zone"
-        elif threats and not fight:
-            goal_label = "hide"
-            thr = [m for m in threats[:3]]
-            if self.cover is None or tick - self.cover_tick > 8:
-                cv = self.find_cover(pos, thr, C, R, t0)
-                self.cover = cv
-                self.cover_tick = tick
-            if self.cover:
-                dcv = math.hypot(self.cover[0] - x, self.cover[1] - y)
-                if dcv > 2.5:
-                    move, _ = self.go_to(pos, self.cover, tick)
-                    boost = threats[0]["d"] < 90
-                else:
-                    move = (0.0, 0.0)
-            else:
-                th = threats[0]["pos"]
-                ax, ay = unit(x - th[0], y - th[1])
-                # bias toward safe zone center
-                cx, cy = unit(C[0] - x, C[1] - y)
-                mx, my = unit(ax + 0.5 * cx, ay + 0.5 * cy)
-                move = self.free_dir(x, y, mx, my)
-                boost = True
-        elif threats and fight:
-            goal_label = "fight"
-            th = target["pos"]
-            d = target["d"]
+        elif threats or npc_fight:
+            tgt = target if target is not None else threats[0]
+            th = tgt["pos"]
+            d = tgt.get("d", math.hypot(th[0] - x, th[1] - y))
             ux, uy = unit(th[0] - x, th[1] - y)
-            pref = 28.0 if has_lightning else 75.0
-            if t > self.strafe_flip:
-                self.strafe = -self.strafe
-                self.strafe_flip = t + 0.8 + self.rng.random() * 1.0
-            rad = 0.0
-            if d > pref + 8:
-                rad = 1.0
-            elif d < pref - 8:
+            sm = self.strafe * self.strafe_mag
+            if npc_fight:
+                goal_label = "npc"
+                rad = 1.0 if d > 30 else (-1.0 if d < 18 else 0.0)
+            elif engage_ok:
+                goal_label = "duel"
+                rad = 1.0 if d > 110 else (-1.0 if d < 70 else 0.0)
+            else:
+                goal_label = "retreat"
                 rad = -1.0
-            mx = ux * rad - uy * self.strafe * 0.9
-            my = uy * rad + ux * self.strafe * 0.9
-            move = self.free_dir(x, y, *unit(mx, my), 10.0)
-            if has_lightning and d > 35 and me["energy"] > 40:
-                boost = True
+            mx = ux * rad - uy * sm * 0.9
+            my = uy * rad + ux * sm * 0.9
+            if goal_label == "retreat":
+                # run away from the pack, but stay on the inland side of the zone edge
+                cxu, cyu = unit(C[0] - x, C[1] - y)
+                if dC > edge_r:
+                    mx, my = mx + cxu * 0.8, my + cyu * 0.8
+                if len(threats) > 1:
+                    ax = sum(m["pos"][0] for m in threats) / len(threats)
+                    ay = sum(m["pos"][1] for m in threats) / len(threats)
+                    ux2, uy2 = unit(ax - x, ay - y)
+                    mx = -ux2 + (-uy2 * sm * 0.7)
+                    my = -uy2 + (ux2 * sm * 0.7)
+                    if dC > edge_r:
+                        mx, my = mx + cxu * 0.8, my + cyu * 0.8
+            elif dC > edge_r * 1.1:
+                cxu, cyu = unit(C[0] - x, C[1] - y)
+                mx, my = mx + cxu * 0.6, my + cyu * 0.6
+            move = self.free_dir(x, y, *unit(mx, my), 12.0)
+            boost = goal_label == "retreat" and d < 100 or (goal_label == "duel" and d > 140)
         else:
             # ---- loot / objectives
             goal = None
@@ -338,10 +332,6 @@ class Bot:
                     if kind not in WEAPON_RANK or pid in took_fail:
                         continue
                     cur1 = have[1] if len(have) > 1 else None
-                    if "lightning" in have:
-                        continue
-                    if kind == "laser" and cur1 is not None:
-                        continue
                     if kind in have:
                         continue
                     pd = math.hypot(pp[0] - x, pp[1] - y)
@@ -390,10 +380,10 @@ class Bot:
                 boost = (math.hypot(goal[0] - x, goal[1] - y) > 60 and me["energy"] > 70)
             elif goal_label == "":
                 # idle: hold position, drift toward zone center slowly if far
-                goal_label = "hold"
-                if dC > safe_r * 0.5 and dC > 25:
-                    move, _ = self.go_to(pos, (C[0], C[1]), tick)
-                    move = (move[0] * 0.7, move[1] * 0.7)
+                goal_label = "edge"
+                if dC > edge_r * 1.1 or dC < edge_r * 0.7:
+                    move, _ = self.go_to(pos, edge_pt, tick)
+                    move = (move[0] * 0.8, move[1] * 0.8)
 
         # ---- stuck handling
         self.hist.append((t, x, y))
@@ -454,7 +444,9 @@ class Bot:
                 elif k == "laser":
                     if tkind == "mech" and d < 240 and clear:
                         ch = wp.get("charge", 0)
-                        if ch >= 0.72 and err < tol * 1.2:
+                        if ch >= 0.72 and err >= tol * 1.2 and ch < 1.4:
+                            fire[i] = True
+                        elif ch >= 0.72:
                             fire[i] = False
                         elif wp["cooldown"] < 0.15 and ch < 0.72:
                             fire[i] = True
