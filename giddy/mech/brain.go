@@ -1046,6 +1046,30 @@ func (b *Brain) step(o *Obs, act *Action) {
 		}
 	}
 
+	// NoisyBoy: our target just slipped out of view (behind a building, around a corner). Keep the
+	// laser charge and aim where it was, instead of letting go and firing the shot into the idle aim.
+	// Practice mode turns Peek off, so the hidden-foe hold above never runs there.
+	if target == nil && foe == nil && farm == nil && farmPos == nil && b.stickAt > 0 && now-b.stickAt < 1.0 &&
+		mode != "zone" && mode != "escape" && mode != "unstuck" {
+		if t := b.tracks[b.stickID]; t != nil && now-t.Seen < 1.0 {
+			for i, w := range me.Weapons {
+				if w == nil || i > 1 || w.Kind != "laser" || w.Charge <= 0 || w.Charge >= w.Stats.Charge+w.Stats.HoldS-0.35 {
+					continue
+				}
+				age := math.Min(now-t.Seen, 0.5)
+				c := b.center(t)
+				c[0] += t.Vel[0] * age
+				c[1] += t.Vel[1] * age
+				if hyp(c[0]-x, c[1]-y) > w.Stats.Range*0.97 {
+					continue
+				}
+				act.Fire[i] = true
+				aim = [2]float64{math.Atan2(c[1]-muzzle[1], c[0]-muzzle[0]), math.Atan2(c[2]-muzzle[2], hyp(c[0]-muzzle[0], c[1]-muzzle[1]))}
+				haveAim = true
+			}
+		}
+	}
+
 	if !haveAim {
 
 		var watch *Track
