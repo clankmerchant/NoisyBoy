@@ -1,376 +1,220 @@
-"""Static map model: terrain heights, clearance-inflated grid, 3D line of sight, bounded A* pathing."""
+"""Static map model: terrain, buildings, line of sight and A* navigation."""
 import heapq
-import json
 import math
 import sys
 import time
-from array import array
 
-CELL = 3.0
+import numpy as np
 
-_NB = (
-    (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
-    (1, 1, 1.4142), (1, -1, 1.4142), (-1, 1, 1.4142), (-1, -1, 1.4142),
-)
-# wall-proximity penalty indexed by self.near value (0 = open, 1 = two cells from wall, 2 = adjacent)
-_PEN = (0.0, 0.4, 1.4)
+from precompute import dilate, rasterize
+
+SQ2 = math.sqrt(2.0)
 
 
 class World:
-    def __init__(self, mapdir):
-        with open(mapdir + "/v2/world.json") as f:
-            w = json.load(f)
+    def __init__(self, arena_dir: str):
+        import json
+
+        t0 = time.time()
+        w = json.load(open(f"{arena_dir}/v2/world.json"))
         t = w["terrain"]
-        self.tmx, self.tmy, self.tnx, self.tny = t["minX"], t["minY"], t["nx"], t["ny"]
-        self.ter = array("h")
-        with open(mapdir + "/v2/terrain.i16", "rb") as f:
-            self.ter.frombytes(f.read())
-        if sys.byteorder != "little":
-            self.ter.byteswap()
-
-        self.ox, self.oy = self.tmx, self.tmy
-        self.W = int((self.tnx - 1) / CELL) + 1
-        self.H = int((self.tny - 1) / CELL) + 1
-        n = self.W * self.H
-        self.blocked = bytearray(n)
-        self.top = [-1e9] * n
-        self.near = bytearray(n)
-
-        self._raster(w.get("prisms") or [])
-        self._slopes()
-        self._near()
-
-    # ---- terrain
-    def h(self, x, y):
-        fx = x - self.tmx
-        fy = y - self.tmy
-        if fx < 0.0:
-            fx = 0.0
-        elif fx > self.tnx - 1.001:
-            fx = self.tnx - 1.001
-        if fy < 0.0:
-            fy = 0.0
-        elif fy > self.tny - 1.001:
-            fy = self.tny - 1.001
-
-        i = int(fx)
-        j = int(fy)
-        ax = fx - i
-        ay = fy - j
-        k = j * self.tnx + i
-        ter = self.ter
-        a = ter[k] * (1.0 - ax) + ter[k + 1] * ax
-        c = ter[k + self.tnx] * (1.0 - ax) + ter[k + self.tnx + 1] * ax
-        return (a * (1.0 - ay) + c * ay) * 0.01
-
-    # ---- grid
-    def ci(self, x, y):
-        gx = int((x - self.ox) / CELL)
-        gy = int((y - self.oy) / CELL)
-        if x < self.ox or y < self.oy or gx >= self.W or gy >= self.H:
-            return -1
-        return gy * self.W + gx
-
-    def center(self, c):
-        gy, gx = divmod(c, self.W)
-        return (self.ox + (gx + 0.5) * CELL, self.oy + (gy + 0.5) * CELL)
-
-    def is_blocked(self, x, y):
-        c = self.ci(x, y)
-        return c < 0 or self.blocked[c] == 1
-
-    def snap(self, x, y, rmax=12):
-        """Centre of the nearest walkable cell to (x, y); falls back to (x, y)."""
-        c = self.nearest_free(self.ci(x, y), rmax)
-        if c < 0:
-            return (x, y)
-        return self.center(c)
-
-    @staticmethod
-    def _inside(ring, x, y):
-        n = len(ring) // 2
-        ins = False
-        j = n - 1
-        for i in range(n):
-            xi = ring[2 * i]
-            yi = ring[2 * i + 1]
-            xj = ring[2 * j]
-            yj = ring[2 * j + 1]
-            if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
-                ins = not ins
-            j = i
-        return ins
-
-    def _raster(self, prisms):
-        # 9-point mech hitbox footprint (2.1m radius) to prevent corner clipping
-        r = 2.1
-        d = r * 0.7071
-        offs = (
-            (0.0, 0.0),
-            (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r),
-            (d, d), (d, -d), (-d, d), (-d, -d),
-        )
-        inside = self._inside
-        hfn = self.h
-        W, H, ox, oy = self.W, self.H, self.ox, self.oy
-        blocked, topv = self.blocked, self.top
-
-        for p in prisms:
-            try:
-                ring = p["ring"]
-                if len(ring) < 6:
-                    continue
-                base, top = p["base"], p["top"]
-            except Exception:
+        self.nx, self.ny = int(t["nx"]), int(t["ny"])
+        self.minx, self.miny = float(t["minX"]), float(t["minY"])
+        nx, ny = self.nx, self.ny
+        ground = np.fromfile(f"{arena_dir}/v2/terrain.i16", dtype="<i2").reshape(ny, nx).astype(np.float32) * float(t.get("scale", 0.01))
+        roof = np.full((ny, nx), -1000.0, dtype=np.float32)
+        bbase = np.full((ny, nx), 1000.0, dtype=np.float32)
+        btop = np.full((ny, nx), -1000.0, dtype=np.float32)
+        for p in w["prisms"]:
+            r = rasterize(p["ring"], p.get("holes"), self.minx, self.miny, nx, ny)
+            if r is None:
                 continue
-            xs = ring[0::2]
-            ys = ring[1::2]
-            rminx, rmaxx = min(xs), max(xs)
-            rminy, rmaxy = min(ys), max(ys)
-            gx0 = max(0, int((rminx - 3.0 - ox) / CELL))
-            gx1 = min(W - 1, int((rmaxx + 3.0 - ox) / CELL))
-            gy0 = max(0, int((rminy - 3.0 - oy) / CELL))
-            gy1 = min(H - 1, int((rmaxy + 3.0 - oy) / CELL))
+            j0, j1, i0, i1, m = r
+            if p["kind"] == "bridge":
+                sb = bbase[j0:j1, i0:i1]
+                st = btop[j0:j1, i0:i1]
+                sb[m] = np.minimum(sb[m], p["base"])
+                st[m] = np.maximum(st[m], p["top"])
+            else:
+                sr = roof[j0:j1, i0:i1]
+                sr[m] = np.maximum(sr[m], p["top"])
+        self.ground = ground
+        self.roof = roof
+        self.bbase = bbase
+        self.btop = btop
+        self.surface = np.maximum(ground, roof)
+        solid = roof > ground + 1.2
+        lowbridge = (btop > -999) & (bbase < ground + 9.5) & (btop > ground + 1.2)
+        blocked = solid | lowbridge
+        gy, gx = np.gradient(ground)
+        blocked |= np.hypot(gx, gy) > math.tan(math.radians(47))
+        blocked[:4, :] = True
+        blocked[-4:, :] = True
+        blocked[:, :4] = True
+        blocked[:, -4:] = True
+        self.blocked1 = blocked
+        infl = dilate(blocked, 3.3)
+        nav = ~infl[::2, ::2]
+        self.NW = nav.shape[1]
+        self.NH = nav.shape[0]
+        self.nav_np = nav
+        self.nav = bytearray(nav.astype(np.uint8).ravel().tobytes())
+        # a softer cost: cells hugging walls cost a bit more so paths keep clear of corners
+        near = dilate(blocked, 5.5)[::2, ::2]
+        self.navcost = bytearray((near & nav).astype(np.uint8).ravel().tobytes())
+        print(f"world loaded in {time.time() - t0:.2f}s", file=sys.stderr, flush=True)
 
-            holes = p.get("holes") or []
-            if holes and isinstance(holes[0], (int, float)):
-                holes = [holes]
-            holes = [hh for hh in holes if len(hh) >= 6]
+    # ---------- height queries ----------
+    def _ij(self, x, y):
+        i = int(round(x - self.minx))
+        j = int(round(y - self.miny))
+        if i < 0:
+            i = 0
+        elif i >= self.nx:
+            i = self.nx - 1
+        if j < 0:
+            j = 0
+        elif j >= self.ny:
+            j = self.ny - 1
+        return i, j
 
-            for gy in range(gy0, gy1 + 1):
-                cy = oy + (gy + 0.5) * CELL
-                if cy < rminy - r or cy > rmaxy + r:
-                    continue
-                row = gy * W
-                for gx in range(gx0, gx1 + 1):
-                    cx = ox + (gx + 0.5) * CELL
-                    if cx < rminx - r or cx > rmaxx + r:
-                        continue
-                    g = hfn(cx, cy)
-                    if not (base < g + 9.5 and top > g + 1.1):
-                        continue
-                    hit = False
-                    for dx, dy in offs:
-                        px, py = cx + dx, cy + dy
-                        if px < rminx or px > rmaxx or py < rminy or py > rmaxy:
-                            continue
-                        if inside(ring, px, py):
-                            in_hole = False
-                            for hh in holes:
-                                if inside(hh, px, py):
-                                    in_hole = True
-                                    break
-                            if not in_hole:
-                                hit = True
-                                break
-                    if hit:
-                        c = row + gx
-                        blocked[c] = 1
-                        if top > topv[c]:
-                            topv[c] = top
+    def ground_at(self, x, y):
+        i, j = self._ij(x, y)
+        return float(self.ground[j, i])
 
-    def _slopes(self):
-        lim2 = 1.05 * 1.05
-        hfn = self.h
-        W, H, ox, oy = self.W, self.H, self.ox, self.oy
-        blocked = self.blocked
-        for gy in range(H):
-            cy = oy + (gy + 0.5) * CELL
-            row = gy * W
-            for gx in range(W):
-                c = row + gx
-                if blocked[c]:
-                    continue
-                cx = ox + (gx + 0.5) * CELL
-                dx = (hfn(cx + 2.0, cy) - hfn(cx - 2.0, cy)) * 0.25
-                dy = (hfn(cx, cy + 2.0) - hfn(cx, cy - 2.0)) * 0.25
-                if dx * dx + dy * dy > lim2:
-                    blocked[c] = 1
+    def surface_at(self, x, y):
+        i, j = self._ij(x, y)
+        return float(self.surface[j, i])
 
-    def _near(self):
-        """Mark 2-ring wall proximity: 2 = adjacent to wall, 1 = 2 cells away."""
-        W, H = self.W, self.H
-        blocked = self.blocked
-        near = self.near
-        ring8 = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
-        for gy in range(H):
-            row = gy * W
-            for gx in range(W):
-                c = row + gx
-                if blocked[c]:
-                    continue
-                for dx, dy in ring8:
-                    nx, ny = gx + dx, gy + dy
-                    if nx < 0 or ny < 0 or nx >= W or ny >= H or blocked[ny * W + nx]:
-                        near[c] = 2
-                        break
+    def is_solid(self, x, y):
+        i, j = self._ij(x, y)
+        return bool(self.blocked1[j, i])
 
-        ring4 = ((1, 0), (-1, 0), (0, 1), (0, -1))
-        for gy in range(H):
-            row = gy * W
-            for gx in range(W):
-                c = row + gx
-                if blocked[c] or near[c]:
-                    continue
-                for dx, dy in ring4:
-                    nx, ny = gx + dx, gy + dy
-                    if 0 <= nx < W and 0 <= ny < H and near[ny * W + nx] == 2:
-                        near[c] = 1
-                        break
-
-    # ---- queries
-    def walk_line(self, x0, y0, x1, y1, step=1.2):
-        dx, dy = x1 - x0, y1 - y0
-        d = math.hypot(dx, dy)
-        if d < 1e-6:
-            return not self.is_blocked(x0, y0)
-        n = int(d / step) + 1
-        inv_n = 1.0 / n
-        ox, oy, W, H = self.ox, self.oy, self.W, self.H
-        blocked = self.blocked
-        for i in range(1, n + 1):
-            f = i * inv_n
-            ux = x0 + dx * f - ox
-            uy = y0 + dy * f - oy
-            if ux < 0.0 or uy < 0.0:
-                return False
-            gx = int(ux / CELL)
-            gy = int(uy / CELL)
-            if gx >= W or gy >= H or blocked[gy * W + gx]:
-                return False
-        return True
-
-    def los(self, a, b, step=3.0):
-        """True if nothing in the grid blocks the 3D segment a -> b."""
-        ax, ay, az = a[0], a[1], a[2]
-        dx, dy, dz = b[0] - ax, b[1] - ay, b[2] - az
-        d = math.hypot(dx, dy)
-        n = int(d / step)
-        if n <= 0:
+    # ---------- line of sight (buildings, terrain, bridges; trees ignored) ----------
+    def los(self, a, b, step=1.0, skip=1.5):
+        ax, ay, az = a
+        bx, by, bz = b
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        L = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if L < 2 * skip + 0.5:
             return True
-        top = self.top
-        hfn = self.h
-        ci = self.ci
-        inv = 1.0 / (n + 1)
-        for i in range(1, n + 1):
-            f = i * inv
-            x = ax + dx * f
-            y = ay + dy * f
-            c = ci(x, y)
-            if c < 0:
-                return False
-            z = az + dz * f
-            if top[c] > z:
-                return False
-            if hfn(x, y) > z + 0.45:
+        n = int((L - 2 * skip) / step) + 1
+        ts = (skip + np.arange(n) * step) / L
+        xs = ax + ts * dx
+        ys = ay + ts * dy
+        zs = az + ts * dz
+        i = np.rint(xs - self.minx).astype(np.int32)
+        j = np.rint(ys - self.miny).astype(np.int32)
+        np.clip(i, 0, self.nx - 1, out=i)
+        np.clip(j, 0, self.ny - 1, out=j)
+        if (zs < self.roof[j, i]).any():
+            return False
+        if (zs < self.ground[j, i] - 0.3).any():
+            return False
+        if ((zs > self.bbase[j, i]) & (zs < self.btop[j, i])).any():
+            return False
+        return True
+
+    # ---------- navigation on a 2 m grid ----------
+    def cell(self, x, y):
+        gi = int(round((x - self.minx) / 2.0))
+        gj = int(round((y - self.miny) / 2.0))
+        gi = min(max(gi, 0), self.NW - 1)
+        gj = min(max(gj, 0), self.NH - 1)
+        return gj * self.NW + gi
+
+    def cell_xy(self, c):
+        return (self.minx + 2.0 * (c % self.NW), self.miny + 2.0 * (c // self.NW))
+
+    def open_at(self, x, y):
+        return self.nav[self.cell(x, y)] == 1
+
+    def nearest_open(self, x, y, maxr=30):
+        c = self.cell(x, y)
+        if self.nav[c]:
+            return c
+        W = self.NW
+        ci, cj = c % W, c // W
+        for r in range(1, maxr + 1):
+            best = None
+            bd = 1e9
+            for dj in range(-r, r + 1):
+                for di in (-r, r) if abs(dj) != r else range(-r, r + 1):
+                    i, j = ci + di, cj + dj
+                    if 0 <= i < W and 0 <= j < self.NH and self.nav[j * W + i]:
+                        d = di * di + dj * dj
+                        if d < bd:
+                            bd = d
+                            best = j * W + i
+            if best is not None:
+                return best
+        return None
+
+    def clear_line(self, a, b):
+        """Straight walk from a to b stays on open nav cells."""
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L = math.hypot(dx, dy)
+        n = int(L / 1.0) + 1
+        nav = self.nav
+        for k in range(1, n + 1):
+            t = k / n
+            if not nav[self.cell(a[0] + dx * t, a[1] + dy * t)]:
                 return False
         return True
 
-    def nearest_free(self, c, rmax=12):
-        if c < 0:
-            return -1
-        if not self.blocked[c]:
-            return c
-        gy, gx = divmod(c, self.W)
-        W, H = self.W, self.H
-        blocked = self.blocked
-        for r in range(1, rmax + 1):
-            best = None
-            for dy in range(-r, r + 1):
-                yy = gy + dy
-                if yy < 0 or yy >= H:
-                    continue
-                edge_row = (dy == -r or dy == r)
-                step = 1 if edge_row else 2 * r
-                for dx in range(-r, r + 1, step):
-                    xx = gx + dx
-                    if 0 <= xx < W and not blocked[yy * W + xx]:
-                        dd = dx * dx + dy * dy
-                        if best is None or dd < best[0]:
-                            best = (dd, yy * W + xx)
-            if best:
-                return best[1]
-        return -1
-
-    def plan(self, sx, sy, gx, gy, maxexp=3200, budget=0.007):
-        """Bounded weighted A*. Returns a list of cell centres (possibly a partial
-        path toward the goal if the node/time budget runs out), or None."""
-        tstart = time.perf_counter()
-        s = self.nearest_free(self.ci(sx, sy))
-        g = self.nearest_free(self.ci(gx, gy), 20)
-        if s < 0 or g < 0:
+    def astar(self, sx, sy, gx, gy, max_exp=3000, weight=1.4, budget_s=0.012):
+        s = self.nearest_open(sx, sy)
+        g = self.nearest_open(gx, gy)
+        if s is None or g is None:
             return None
-        if s == g:
-            return [self.center(g)]
+        W = self.NW
+        nav = self.nav
+        cost = self.navcost
+        gi, gj = g % W, g // W
 
-        W, H = self.W, self.H
-        goal_y, goal_x = divmod(g, W)
-        blocked, near = self.blocked, self.near
-        pen = _PEN
-        pc = time.perf_counter
-        push, pop = heapq.heappush, heapq.heappop
+        def h(c):
+            di = abs(c % W - gi)
+            dj = abs(c // W - gj)
+            return (di + dj + (SQ2 - 2) * min(di, dj)) * weight
 
-        sy_, sx_ = divmod(s, W)
-        ddx, ddy = abs(sx_ - goal_x), abs(sy_ - goal_y)
-        h0 = ddx + ddy - 0.5858 * min(ddx, ddy)
-
+        nbrs = ((1, 1.0), (-1, 1.0), (W, 1.0), (-W, 1.0), (W + 1, SQ2), (W - 1, SQ2), (-W + 1, SQ2), (-W - 1, SQ2))
         gs = {s: 0.0}
-        came = {}
+        came = {s: -1}
         closed = set()
-        heap = [(h0 * 1.15, 0, s)]
-        cnt = 0
+        heap = [(h(s), s)]
+        best, besth = s, h(s)
         exp = 0
-        best_h, best_c = h0, s
-
-        while heap and exp < maxexp:
-            _, _, c = pop(heap)
-            if c in closed:
+        push, pop = heapq.heappush, heapq.heappop
+        N = len(nav)
+        deadline = time.perf_counter() + budget_s
+        while heap and exp < max_exp:
+            if (exp & 255) == 255 and time.perf_counter() > deadline:
+                break
+            f, n = pop(heap)
+            if n in closed:
                 continue
-            closed.add(c)
-            if c == g:
-                best_c = c
+            if n == g:
+                best = g
                 break
+            closed.add(n)
             exp += 1
-            if (exp & 63) == 0 and (pc() - tstart) > budget:
-                break
-
-            cy, cx = divmod(c, W)
-            gcur = gs[c]
-            for dx, dy, cost in _NB:
-                nx = cx + dx
-                ny = cy + dy
-                if nx < 0 or ny < 0 or nx >= W or ny >= H:
+            hn = f - gs[n]
+            if hn < besth:
+                besth, best = hn, n
+            gn = gs[n]
+            for d, c in nbrs:
+                m = n + d
+                if m < 0 or m >= N or not nav[m] or m in closed:
                     continue
-                n = ny * W + nx
-                if blocked[n] or n in closed:
-                    continue
-                # prevent diagonal corner-cutting across blocked cells
-                if dx and dy and (blocked[cy * W + nx] or blocked[ny * W + cx]):
-                    continue
-                ng = gcur + cost + pen[near[n]]
-                if ng < gs.get(n, 1e18):
-                    gs[n] = ng
-                    came[n] = c
-                    ex = nx - goal_x
-                    if ex < 0:
-                        ex = -ex
-                    ey = ny - goal_y
-                    if ey < 0:
-                        ey = -ey
-                    hh = ex + ey - 0.5858 * (ex if ex < ey else ey)
-                    if hh < best_h:
-                        best_h = hh
-                        best_c = n
-                    cnt += 1
-                    push(heap, (ng + hh * 1.15, cnt, n))
-
-        path = [best_c]
-        while path[-1] in came:
-            path.append(came[path[-1]])
+                ng = gn + c + (0.6 * c if cost[m] else 0.0)
+                if ng < gs.get(m, 1e18):
+                    gs[m] = ng
+                    came[m] = n
+                    push(heap, (ng + h(m), m))
+        path = []
+        n = best
+        while n != -1:
+            path.append(self.cell_xy(n))
+            n = came[n]
         path.reverse()
-        return [self.center(c) for c in path]
-
-    @staticmethod
-    def _oct(x0, y0, x1, y1):
-        dx, dy = abs(x1 - x0), abs(y1 - y0)
-        return (dx + dy) + (1.4142 - 2.0) * min(dx, dy)
+        return path, best == g
