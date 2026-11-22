@@ -198,6 +198,7 @@ class Bot:
             if time.perf_counter() - t0 > 0.005:
                 break
         return best_pt
+
     def act(self, obs):
         t0 = time.perf_counter()
         me = obs["self"]
@@ -278,6 +279,7 @@ class Bot:
             vx_z, vy_z = unit(x - ccx, y - ccy)
         surf_r = max(nR * 0.75, cR - 14.0)
         surf_pt = (ccx + vx_z * surf_r, ccy + vy_z * surf_r)
+        surf_x, surf_y = surf_pt
 
         dist_cur_center = math.hypot(x - ccx, y - ccy)
         zone_unsafe = (not me["in_zone"]) or dist_cur_center > (cR - 8.5)
@@ -387,9 +389,8 @@ class Bot:
                 boost = first_th["d"] < 70.0 and me["energy"] > 30
             else:
                 thx, thy, _ = first_th["pos"]
-                sx, sy = surf_pt
                 ax, ay = unit(x - thx, y - thy)
-                cx, cy = unit(sx - x, sy - y)
+                cx, cy = unit(surf_x - x, surf_y - y)
                 stx, sty = -ay * self.strafe * 0.5, ax * self.strafe * 0.5
                 rdx, rdy = unit(ax + 0.6 * cx + stx, ay + 0.6 * cy + sty)
                 cdx, cdy = self.zone_clamp_dir(x, y, rdx, rdy, cC, cR, margin=12.0)
@@ -399,7 +400,7 @@ class Bot:
         else:
             goal = None
 
-            # 5a. Laser Pickup
+            # 5a. Laser Pickup (Never pick up Lightning)
             if "laser" not in have:
                 best_laser = None
                 cur1 = have[1] if len(have) > 1 else None
@@ -436,15 +437,16 @@ class Bot:
                     _, cx, cy = best_cube
                     goal = (cx, cy)
                     goal_label = "cube"
+
             # 5c. Supply Drops
             if goal is None:
                 for dr in obs["drops"]:
                     did = dr["id"]
                     if did in self.dead_drops:
                         continue
-                    dp = dr["pos"]
-                    dd = math.hypot(dp[0] - x, dp[1] - y)
-                    if math.hypot(dp[0] - cC[0], dp[1] - cC[1]) > cR - 10.0:
+                    dpx, dpy, _ = dr["pos"]
+                    dd = math.hypot(dpx - x, dpy - y)
+                    if math.hypot(dpx - ccx, dpy - ccy) > cR - 10.0:
                         continue
                     if dd < 190.0 and dr["lands_in"] <= (dd / walk + 6.0):
                         if dd < dr["radius"] * 0.65:
@@ -452,11 +454,11 @@ class Bot:
                             if self.drop_dwell[did] > 45:
                                 self.dead_drops.add(did)
                                 continue
-                            ux, uy = unit(dp[0] - x, dp[1] - y)
+                            ux, uy = unit(dpx - x, dpy - y)
                             move = self.free_dir(x, y, *unit(-uy * self.strafe, ux * self.strafe), dist=6.0)
                             goal_label = "capture"
                         else:
-                            goal = (dp[0], dp[1])
+                            goal = (dpx, dpy)
                             goal_label = "drop"
                         break
 
@@ -464,40 +466,41 @@ class Bot:
             if goal is None and goal_label != "capture" and hp_frac > 0.35:
                 best_crate = None
                 for c in obs["crates"]:
-                    cp = c["pos"]
-                    cd = math.hypot(cp[0] - x, cp[1] - y)
-                    if cd < 90.0 and abs(cp[2] - z) < 6.5 and math.hypot(cp[0] - cC[0], cp[1] - cC[1]) < cR - 10.0:
+                    cpx, cpy, cpz = c["pos"]
+                    cd = math.hypot(cpx - x, cpy - y)
+                    if cd < 90.0 and abs(cpz - z) < 6.5 and math.hypot(cpx - ccx, cpy - ccy) < cR - 10.0:
                         if best_crate is None or cd < best_crate[0]:
-                            best_crate = (cd, cp)
-                if best_crate:
+                            best_crate = (cd, c["pos"])
+                if best_crate is not None:
                     cd, cp = best_crate
+                    cpx, cpy, _ = cp
                     goal_label = "crate"
                     if cd > 26.0:
-                        goal = (cp[0], cp[1])
+                        goal = (cpx, cpy)
                     else:
-                        ux, uy = unit(cp[0] - x, cp[1] - y)
+                        ux, uy = unit(cpx - x, cpy - y)
                         move = self.free_dir(x, y, *unit(-uy * self.strafe, ux * self.strafe), dist=6.0)
                     if target is None:
                         target, tkind = {"pos": cp, "vel": [0.0, 0.0, 0.0], "d": cd, "kind": "crate"}, "crate"
 
             # 5e. Farmable NPCs
             if goal is None and goal_label == "" and target is not None and tkind == "npc":
-                goal = (target["pos"][0], target["pos"][1])
+                nx, ny, _ = target["pos"]
+                goal = (nx, ny)
                 goal_label = "npc"
 
-            # 5f. Outer-Ring Surf -> Silent Hold (Stop making footsteps once positioned!)
+            # 5f. Outer-Ring Surf -> Silent Hold
             if goal is not None:
                 move, arrived = self.go_to(pos, goal, tick)
                 if arrived:
                     move = (0.0, 0.0)
-                boost = math.hypot(goal[0] - x, goal[1] - y) > 70.0 and me["energy"] > 75
+                gx, gy = goal
+                boost = math.hypot(gx - x, gy - y) > 70.0 and me["energy"] > 75
             elif goal_label == "":
-                d_surf = math.hypot(surf_pt[0] - x, surf_pt[1] - y)
-                if d_surf > 16.0:
+                if math.hypot(surf_x - x, surf_y - y) > 16.0:
                     move, _ = self.go_to(pos, surf_pt, tick)
                     goal_label = "surf_edge"
                 else:
-                    # Top-16 stealth hold: stand still on the outer edge so we emit zero footstep audio
                     move = (0.0, 0.0)
                     goal_label = "silent_hold"
 
@@ -506,7 +509,8 @@ class Bot:
         if len(self.hist) > 12:
             self.hist.pop(0)
 
-        wants_move = math.hypot(*move) > 0.4
+        mvx, mvy = move
+        wants_move = math.hypot(mvx, mvy) > 0.4
         jump = False
         if t < self.unstick_until:
             move = self.unstick_dir
@@ -516,7 +520,7 @@ class Bot:
         elif wants_move and len(self.hist) >= 10:
             t_old, x_old, y_old = self.hist[0]
             if (t - t_old) >= 0.75 and math.hypot(x - x_old, y - y_old) < 2.2:
-                a = math.atan2(move[1], move[0]) + self.rng.choice((-1.0, 1.0)) * (0.9 + self.rng.random() * 0.8)
+                a = math.atan2(mvy, mvx) + self.rng.choice((-1.0, 1.0)) * (0.9 + self.rng.random() * 0.8)
                 self.unstick_dir = (math.cos(a), math.sin(a))
                 self.unstick_until = t + 0.85
                 self.hist.clear()
@@ -530,27 +534,28 @@ class Bot:
         if jump and me["grounded"] is False:
             boost = me["energy"] > 15
 
-        # 10. Center-Mass Aiming & Firing (Autocannon + Laser Combo)
+        # 10. Center-Mass Aiming & Firing
         fire = [False, False]
-        aim_yaw, aim_pitch = me["aim"][0], me["aim"][1]
+        cur_yaw, cur_pitch = me["aim"]
+        aim_yaw, aim_pitch = cur_yaw, cur_pitch
 
         if target is not None:
-            tp = target["pos"]
+            tpx, tpy, tpz = target["pos"]
             tv = target.get("vel", [0.0, 0.0, 0.0])
-            tz = tp[2] + (5.5 if tkind == "mech" else 2.2 if tkind == "npc" else 1.5)
+            tz = tpz + (5.5 if tkind == "mech" else 2.2 if tkind == "npc" else 1.5)
 
             gun = weapons[0] if weapons and weapons[0] and weapons[0]["kind"] == "gun" else None
             sp = gun["stats"]["speed"] if gun else 252.0
-            lp = self.lead((x, y, z + muzzle), (tp[0], tp[1], tz), tv, sp)
+            lpx, lpy, lpz = self.lead((x, y, z + muzzle), (tpx, tpy, tz), tv, sp)
 
-            hd = math.hypot(lp[0] - x, lp[1] - y)
-            aim_yaw = math.atan2(lp[1] - y, lp[0] - x)
-            aim_pitch = max(-0.75, min(1.35, math.atan2(lp[2] - (z + muzzle), max(hd, 1e-3))))
+            hd = math.hypot(lpx - x, lpy - y)
+            aim_yaw = math.atan2(lpy - y, lpx - x)
+            aim_pitch = max(-0.75, min(1.35, math.atan2(lpz - (z + muzzle), max(hd, 1e-3))))
 
-            err = abs(norm_ang(me["aim"][0] - aim_yaw))
+            err = abs(norm_ang(cur_yaw - aim_yaw))
             d = target["d"]
             tol = math.atan2(3.4, max(d, 5.0)) + 0.055
-            clear = w.los((x, y, z + muzzle), (tp[0], tp[1], tz)) or d < 22.0
+            clear = w.los((x, y, z + muzzle), (tpx, tpy, tz)) or d < 22.0
 
             for i, wp in enumerate(weapons):
                 if not wp:
@@ -567,21 +572,21 @@ class Bot:
                         elif wp.get("cooldown", 0.0) < 0.15:
                             fire[i] = True
         else:
-            # Top-16 360-degree continuous scan while holding silent position
             snd = next(
                 (s for s in obs["sounds"] if s["kind"] in ("gun", "laser", "lightning", "mortar", "explosion") and s["dist"] != "far"),
                 None,
             )
+            mvx, mvy = move
             if virtual:
                 aim_yaw = self.last_dmg_bearing
             elif snd:
                 aim_yaw = snd["bearing"]
             elif goal_label == "silent_hold":
-                aim_yaw = norm_ang(me["aim"][0] + 0.42)
-            elif math.hypot(*move) > 0.3:
-                aim_yaw = math.atan2(move[1], move[0])
+                aim_yaw = norm_ang(cur_yaw + 0.42)
+            elif math.hypot(mvx, mvy) > 0.3:
+                aim_yaw = math.atan2(mvy, mvx)
             else:
-                aim_yaw = norm_ang(me["aim"][0] + 0.25)
+                aim_yaw = norm_ang(cur_yaw + 0.25)
             aim_pitch = 0.0
 
         gun_w = weapons[0] if weapons and weapons[0] and weapons[0]["kind"] == "gun" else None
@@ -590,12 +595,13 @@ class Bot:
             if ammo == 0 or (ammo <= 5 and (target is None or target["d"] > 70.0)):
                 act["reload"] = True
 
-        mv = math.hypot(*move)
+        mvx, mvy = move
+        mv = math.hypot(mvx, mvy)
         if mv > 1.0:
-            move = (move[0] / mv, move[1] / mv)
+            mvx, mvy = mvx / mv, mvy / mv
 
         act.update(
-            move=[round(move[0], 3), round(move[1], 3)],
+            move=[round(mvx, 3), round(mvy, 3)],
             boost=bool(boost),
             jump=bool(jump),
             aim=[round(aim_yaw, 4), round(aim_pitch, 4)],
@@ -604,7 +610,8 @@ class Bot:
 
         mf.draw.label(f"{goal_label} hp:{me['hp']:.0f} e:{me['energy']:.0f} th:{len(close_threats)}")
         if self.path and goal_label not in ("kite_fight", "dash", "retreat"):
-            mf.draw.line([x, y, z + 1.0], [self.path[-1][0], self.path[-1][1], z + 1.0], "#40c0ff")
+            end_x, end_y = self.path[-1]
+            mf.draw.line([x, y, z + 1.0], [end_x, end_y, z + 1.0], "#40c0ff")
 
         if (time.perf_counter() - t0) > 0.015:
             self.slow_until = tick + 6
