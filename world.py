@@ -1,4 +1,4 @@
-"""Static map model: terrain heights, clearance-inflated grid, 3D line of sight, A* pathing."""
+"""Static map model: terrain heights, clearance-inflated grid, 3D line of sight, bounded A* pathing."""
 import heapq
 import json
 import math
@@ -7,6 +7,13 @@ import time
 from array import array
 
 CELL = 3.0
+
+_NB = (
+    (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+    (1, 1, 1.4142), (1, -1, 1.4142), (-1, 1, 1.4142), (-1, -1, 1.4142),
+)
+# wall-proximity penalty indexed by self.near value (0 = open, 1 = two cells from wall, 2 = adjacent)
+_PEN = (0.0, 0.4, 1.4)
 
 
 class World:
@@ -29,7 +36,7 @@ class World:
         self.top = [-1e9] * n
         self.near = bytearray(n)
 
-        self._raster(w["prisms"])
+        self._raster(w.get("prisms") or [])
         self._slopes()
         self._near()
 
@@ -60,7 +67,7 @@ class World:
     def ci(self, x, y):
         gx = int((x - self.ox) / CELL)
         gy = int((y - self.oy) / CELL)
-        if gx < 0 or gy < 0 or gx >= self.W or gy >= self.H:
+        if x < self.ox or y < self.oy or gx >= self.W or gy >= self.H:
             return -1
         return gy * self.W + gx
 
@@ -71,6 +78,13 @@ class World:
     def is_blocked(self, x, y):
         c = self.ci(x, y)
         return c < 0 or self.blocked[c] == 1
+
+    def snap(self, x, y, rmax=12):
+        """Centre of the nearest walkable cell to (x, y); falls back to (x, y)."""
+        c = self.nearest_free(self.ci(x, y), rmax)
+        if c < 0:
+            return (x, y)
+        return self.center(c)
 
     @staticmethod
     def _inside(ring, x, y):
@@ -96,82 +110,109 @@ class World:
             (r, 0.0), (-r, 0.0), (0.0, r), (0.0, -r),
             (d, d), (d, -d), (-d, d), (-d, -d),
         )
+        inside = self._inside
+        hfn = self.h
+        W, H, ox, oy = self.W, self.H, self.ox, self.oy
+        blocked, topv = self.blocked, self.top
+
         for p in prisms:
-            ring = p["ring"]
-            if len(ring) < 6:
+            try:
+                ring = p["ring"]
+                if len(ring) < 6:
+                    continue
+                base, top = p["base"], p["top"]
+            except Exception:
                 continue
             xs = ring[0::2]
             ys = ring[1::2]
-            gx0 = max(0, int((min(xs) - 3.0 - self.ox) / CELL))
-            gx1 = min(self.W - 1, int((max(xs) + 3.0 - self.ox) / CELL))
-            gy0 = max(0, int((min(ys) - 3.0 - self.oy) / CELL))
-            gy1 = min(self.H - 1, int((max(ys) + 3.0 - self.oy) / CELL))
+            rminx, rmaxx = min(xs), max(xs)
+            rminy, rmaxy = min(ys), max(ys)
+            gx0 = max(0, int((rminx - 3.0 - ox) / CELL))
+            gx1 = min(W - 1, int((rmaxx + 3.0 - ox) / CELL))
+            gy0 = max(0, int((rminy - 3.0 - oy) / CELL))
+            gy1 = min(H - 1, int((rmaxy + 3.0 - oy) / CELL))
 
             holes = p.get("holes") or []
             if holes and isinstance(holes[0], (int, float)):
                 holes = [holes]
-            base, top = p["base"], p["top"]
+            holes = [hh for hh in holes if len(hh) >= 6]
 
             for gy in range(gy0, gy1 + 1):
-                cy = self.oy + (gy + 0.5) * CELL
+                cy = oy + (gy + 0.5) * CELL
+                if cy < rminy - r or cy > rmaxy + r:
+                    continue
+                row = gy * W
                 for gx in range(gx0, gx1 + 1):
-                    cx = self.ox + (gx + 0.5) * CELL
+                    cx = ox + (gx + 0.5) * CELL
+                    if cx < rminx - r or cx > rmaxx + r:
+                        continue
+                    g = hfn(cx, cy)
+                    if not (base < g + 9.5 and top > g + 1.1):
+                        continue
                     hit = False
                     for dx, dy in offs:
                         px, py = cx + dx, cy + dy
-                        if self._inside(ring, px, py) and not any(self._inside(hh, px, py) for hh in holes):
-                            hit = True
-                            break
-                    if not hit:
-                        continue
-                    g = self.h(cx, cy)
-                    c = gy * self.W + gx
-                    if base < g + 9.5 and top > g + 1.1:
-                        self.blocked[c] = 1
-                        if top > self.top[c]:
-                            self.top[c] = top
+                        if px < rminx or px > rmaxx or py < rminy or py > rmaxy:
+                            continue
+                        if inside(ring, px, py):
+                            in_hole = False
+                            for hh in holes:
+                                if inside(hh, px, py):
+                                    in_hole = True
+                                    break
+                            if not in_hole:
+                                hit = True
+                                break
+                    if hit:
+                        c = row + gx
+                        blocked[c] = 1
+                        if top > topv[c]:
+                            topv[c] = top
 
     def _slopes(self):
-        lim = 1.05
-        for gy in range(self.H):
-            cy = self.oy + (gy + 0.5) * CELL
-            for gx in range(self.W):
-                c = gy * self.W + gx
-                if self.blocked[c]:
+        lim2 = 1.05 * 1.05
+        hfn = self.h
+        W, H, ox, oy = self.W, self.H, self.ox, self.oy
+        blocked = self.blocked
+        for gy in range(H):
+            cy = oy + (gy + 0.5) * CELL
+            row = gy * W
+            for gx in range(W):
+                c = row + gx
+                if blocked[c]:
                     continue
-                cx = self.ox + (gx + 0.5) * CELL
-                dx = (self.h(cx + 2.0, cy) - self.h(cx - 2.0, cy)) / 4.0
-                dy = (self.h(cx, cy + 2.0) - self.h(cx, cy - 2.0)) / 4.0
-                if dx * dx + dy * dy > lim * lim:
-                    self.blocked[c] = 1
+                cx = ox + (gx + 0.5) * CELL
+                dx = (hfn(cx + 2.0, cy) - hfn(cx - 2.0, cy)) * 0.25
+                dy = (hfn(cx, cy + 2.0) - hfn(cx, cy - 2.0)) * 0.25
+                if dx * dx + dy * dy > lim2:
+                    blocked[c] = 1
 
     def _near(self):
         """Mark 2-ring wall proximity: 2 = adjacent to wall, 1 = 2 cells away."""
         W, H = self.W, self.H
         blocked = self.blocked
         near = self.near
+        ring8 = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
         for gy in range(H):
             row = gy * W
             for gx in range(W):
                 c = row + gx
                 if blocked[c]:
                     continue
-                adj1 = False
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                for dx, dy in ring8:
                     nx, ny = gx + dx, gy + dy
                     if nx < 0 or ny < 0 or nx >= W or ny >= H or blocked[ny * W + nx]:
-                        adj1 = True
+                        near[c] = 2
                         break
-                if adj1:
-                    near[c] = 2
 
+        ring4 = ((1, 0), (-1, 0), (0, 1), (0, -1))
         for gy in range(H):
             row = gy * W
             for gx in range(W):
                 c = row + gx
                 if blocked[c] or near[c]:
                     continue
-                for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                for dx, dy in ring4:
                     nx, ny = gx + dx, gy + dy
                     if 0 <= nx < W and 0 <= ny < H and near[ny * W + nx] == 2:
                         near[c] = 1
@@ -185,62 +226,78 @@ class World:
             return not self.is_blocked(x0, y0)
         n = int(d / step) + 1
         inv_n = 1.0 / n
+        ox, oy, W, H = self.ox, self.oy, self.W, self.H
+        blocked = self.blocked
         for i in range(1, n + 1):
             f = i * inv_n
-            if self.is_blocked(x0 + dx * f, y0 + dy * f):
+            ux = x0 + dx * f - ox
+            uy = y0 + dy * f - oy
+            if ux < 0.0 or uy < 0.0:
+                return False
+            gx = int(ux / CELL)
+            gy = int(uy / CELL)
+            if gx >= W or gy >= H or blocked[gy * W + gx]:
                 return False
         return True
 
     def los(self, a, b, step=3.0):
         """True if nothing in the grid blocks the 3D segment a -> b."""
-        dx, dy, dz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+        ax, ay, az = a[0], a[1], a[2]
+        dx, dy, dz = b[0] - ax, b[1] - ay, b[2] - az
         d = math.hypot(dx, dy)
         n = int(d / step)
         if n <= 0:
             return True
         top = self.top
+        hfn = self.h
+        ci = self.ci
         inv = 1.0 / (n + 1)
         for i in range(1, n + 1):
             f = i * inv
-            x = a[0] + dx * f
-            y = a[1] + dy * f
-            c = self.ci(x, y)
+            x = ax + dx * f
+            y = ay + dy * f
+            c = ci(x, y)
             if c < 0:
                 return False
-            z = a[2] + dz * f
+            z = az + dz * f
             if top[c] > z:
                 return False
-            if self.h(x, y) > z + 0.45:
+            if hfn(x, y) > z + 0.45:
                 return False
         return True
 
     def nearest_free(self, c, rmax=12):
-        if c >= 0 and not self.blocked[c]:
-            return c
         if c < 0:
             return -1
+        if not self.blocked[c]:
+            return c
         gy, gx = divmod(c, self.W)
         W, H = self.W, self.H
         blocked = self.blocked
         for r in range(1, rmax + 1):
             best = None
             for dy in range(-r, r + 1):
-                for dx in range(-r, r + 1):
-                    if max(abs(dx), abs(dy)) != r:
-                        continue
-                    x, y = gx + dx, gy + dy
-                    if 0 <= x < W and 0 <= y < H and not blocked[y * W + x]:
+                yy = gy + dy
+                if yy < 0 or yy >= H:
+                    continue
+                edge_row = (dy == -r or dy == r)
+                step = 1 if edge_row else 2 * r
+                for dx in range(-r, r + 1, step):
+                    xx = gx + dx
+                    if 0 <= xx < W and not blocked[yy * W + xx]:
                         dd = dx * dx + dy * dy
                         if best is None or dd < best[0]:
-                            best = (dd, y * W + x)
+                            best = (dd, yy * W + xx)
             if best:
                 return best[1]
         return -1
 
-    def plan(self, sx, sy, gx, gy, maxexp=8000, budget=0.018):
+    def plan(self, sx, sy, gx, gy, maxexp=3200, budget=0.007):
+        """Bounded weighted A*. Returns a list of cell centres (possibly a partial
+        path toward the goal if the node/time budget runs out), or None."""
         tstart = time.perf_counter()
         s = self.nearest_free(self.ci(sx, sy))
-        g = self.nearest_free(self.ci(gx, gy))
+        g = self.nearest_free(self.ci(gx, gy), 20)
         if s < 0 or g < 0:
             return None
         if s == g:
@@ -249,65 +306,65 @@ class World:
         W, H = self.W, self.H
         goal_y, goal_x = divmod(g, W)
         blocked, near = self.blocked, self.near
+        pen = _PEN
+        pc = time.perf_counter
+        push, pop = heapq.heappush, heapq.heappop
+
+        sy_, sx_ = divmod(s, W)
+        ddx, ddy = abs(sx_ - goal_x), abs(sy_ - goal_y)
+        h0 = ddx + ddy - 0.5858 * min(ddx, ddy)
+
         gs = {s: 0.0}
         came = {}
-        sy_, sx_ = divmod(s, W)
-        h0 = self._oct(sx_, sy_, goal_x, goal_y)
-        heap = [(h0, 0, s)]
-        cnt = 0
-        best = (h0, s)
-        exp = 0
         closed = set()
-
-        neighbors = (
-            (1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
-            (1, 1, 1.4142), (1, -1, 1.4142), (-1, 1, 1.4142), (-1, -1, 1.4142),
-        )
+        heap = [(h0 * 1.15, 0, s)]
+        cnt = 0
+        exp = 0
+        best_h, best_c = h0, s
 
         while heap and exp < maxexp:
-            _, _, c = heapq.heappop(heap)
+            _, _, c = pop(heap)
             if c in closed:
                 continue
             closed.add(c)
             if c == g:
-                best = (0.0, c)
+                best_c = c
                 break
             exp += 1
-            if (exp & 255) == 0 and (time.perf_counter() - tstart) > budget:
+            if (exp & 63) == 0 and (pc() - tstart) > budget:
                 break
 
             cy, cx = divmod(c, W)
-            gc = gs[c]
-            for dx, dy, cost in neighbors:
-                nx, ny = cx + dx, cy + dy
+            gcur = gs[c]
+            for dx, dy, cost in _NB:
+                nx = cx + dx
+                ny = cy + dy
                 if nx < 0 or ny < 0 or nx >= W or ny >= H:
                     continue
                 n = ny * W + nx
-                if blocked[n]:
+                if blocked[n] or n in closed:
                     continue
-                # Prevent diagonal corner-cutting across blocked cells
+                # prevent diagonal corner-cutting across blocked cells
                 if dx and dy and (blocked[cy * W + nx] or blocked[ny * W + cx]):
                     continue
-
-                w_pen = 1.4 if near[n] == 2 else (0.4 if near[n] == 1 else 0.0)
-                ng = gc + cost + w_pen
+                ng = gcur + cost + pen[near[n]]
                 if ng < gs.get(n, 1e18):
                     gs[n] = ng
                     came[n] = c
-                    hh = self._oct(nx, ny, goal_x, goal_y)
-                    if hh < best[0]:
-                        best = (hh, n)
-                if ng < gs.get(n, 1e18):
-                    gs[n] = ng
-                    came[n] = c
-                    hh = self._oct(nx, ny, goal_x, goal_y)
-                    if hh < best[0]:
-                        best = (hh, n)
+                    ex = nx - goal_x
+                    if ex < 0:
+                        ex = -ex
+                    ey = ny - goal_y
+                    if ey < 0:
+                        ey = -ey
+                    hh = ex + ey - 0.5858 * (ex if ex < ey else ey)
+                    if hh < best_h:
+                        best_h = hh
+                        best_c = n
                     cnt += 1
-                    heapq.heappush(heap, (ng + hh * 1.05, cnt, n))
+                    push(heap, (ng + hh * 1.15, cnt, n))
 
-        end = best[1]
-        path = [end]
+        path = [best_c]
         while path[-1] in came:
             path.append(came[path[-1]])
         path.reverse()
