@@ -12,6 +12,7 @@ This folder is **giddygiddyboy's Mech Royale bot** (Go, standard library only), 
 | File | Change |
 | --- | --- |
 | `cmd/bot/main.go` | Bot name in `ready`: `NoisyBoy` |
+| `mech/brain.go` | Practice/FFA detection only before the first zone shrink (zone deaths no longer flip practice into FFA mode); `kills` counts mech kills only |
 
 Everything else is unchanged. Any later change goes in this table.
 
