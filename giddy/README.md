@@ -13,6 +13,7 @@ This folder is **giddygiddyboy's Mech Royale bot** (Go, standard library only), 
 | --- | --- |
 | `cmd/bot/main.go` | Bot name in `ready`: `NoisyBoy` |
 | `mech/brain.go` | Practice/FFA detection only before the first zone shrink (zone deaths no longer flip practice into FFA mode); `kills` counts mech kills only |
+| `mech/brain.go` | Laser hold: when the target slips out of view for under 1 s, keep the charge and aim at its last position instead of firing into the idle aim |
 
 Everything else is unchanged. Any later change goes in this table.
 
