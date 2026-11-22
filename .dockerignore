@@ -2,4 +2,6 @@
 kit/
 tools/
 __pycache__/
+arena/
 *.md
+!giddy/README.md
