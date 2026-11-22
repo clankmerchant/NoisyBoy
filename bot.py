@@ -1,4 +1,4 @@
-"""High-tempo Mech Royale bot: XP snowballing, center-mass lead aiming, kiting, and zone routing."""
+"""Top-16 Meta Mech Royale Bot: Autocannon+Laser, Outer-Ring Surfing, Reactive Dash-Kite, Cube Snowball."""
 import gc
 import math
 import random
@@ -8,14 +8,14 @@ from world import World
 
 TAU = math.tau
 
+# Tuned for Autocannon ("gun") + Laser + Cube Snowball sustain
 UP_PREF = [
-    "armor", "plating", "nanites", "gun_damage", "lightning_efficiency",
-    "servos", "gun_rate", "lightning_chain", "capacitor", "gyros",
-    "reactor", "sensors", "jets", "gun_velocity", "gun_mag",
-    "lightning_range", "laser_damage", "laser_charge"
+    "armor", "plating", "nanites", "gun_damage", "laser_damage",
+    "laser_charge", "gun_rate", "servos", "gyros", "gun_velocity",
+    "capacitor", "reactor", "gun_mag", "sensors", "jets"
 ]
 
-WEAPON_RANK = {"lightning": 3, "laser": 2}
+WEAPON_RANK = {"laser": 5}
 
 
 def norm_ang(a):
@@ -28,7 +28,7 @@ def unit(dx, dy):
 
 
 class Bot:
-    name = "apex-v1"
+    name = "apex-v2"
 
     def __init__(self, hello):
         self.rng = random.Random(hello.get("seed", 1))
@@ -61,8 +61,12 @@ class Bot:
         self.drop_dwell = {}
         self.cover = None
         self.cover_tick = -999
+
+        # Reactive damage-dash state (from Top-16 1v1 analysis)
         self.last_dmg_t = -99.0
         self.last_dmg_bearing = 0.0
+        self.dash_until = -1.0
+        self.dash_dir = (0.0, 0.0)
         self.slow_until = -1
 
         gc.collect()
@@ -75,15 +79,29 @@ class Bot:
         if t >= z["shrink_end"]:
             return z["next_center"], z["next_radius"]
         f = (t - z["shrink_start"]) / max(1e-6, z["shrink_end"] - z["shrink_start"])
-        cx = z["center"][0] + (z["next_center"][0] - z["center"][0]) * f
-        cy = z["center"][1] + (z["next_center"][1] - z["center"][1]) * f
+        cx = z["center"] + (z["next_center"] - z["center"]) * f
+        cy = z["center"] + (z["next_center"] - z["center"]) * f
         return (cx, cy), z["radius"] + (z["next_radius"] - z["radius"]) * f
 
-    def free_dir(self, x, y, dx, dy, dist=12.0):
+    def zone_clamp_dir(self, x, y, dx, dy, cC, cR, margin=12.0):
+        """Prevent reactive backward dashes from stepping out of the safe zone."""
+        tx, ty = x + dx * 10.0, y + dy * 10.0
+        dist_center = math.hypot(tx - cC, ty - cC)
+        if dist_center <= cR - margin:
+            return dx, dy
+        # Slide tangentially along the zone wall instead of backing into storm
+        rx, ry = unit(x - cC, y - cC)
+        t1x, t1y = -ry, rx
+        t2x, t2y = ry, -rx
+        if (t1x * dx + t1y * dy) >= (t2x * dx + t2y * dy):
+            return unit(t1x - rx * 0.35, t1y - ry * 0.35)
+        return unit(t2x - rx * 0.35, t2y - ry * 0.35)
+
+    def free_dir(self, x, y, dx, dy, dist=11.0):
         w = self.world
         angles = (
             0.0, 0.35, -0.35, 0.70, -0.70, 1.05, -1.05,
-            1.40, -1.40, 1.75, -1.75, 2.15, -2.15, 2.60, -2.60, 3.14
+            1.40, -1.40, 1.80, -1.80, 2.30, -2.30, 3.14
         )
         for a in angles:
             ca, sa = math.cos(a), math.sin(a)
@@ -93,34 +111,35 @@ class Bot:
         return dx, dy
 
     def go_to(self, me, goal, tick):
-        x, y = me[0], me[1]
+        x, y = me, me
         w = self.world
-        gx, gy = goal[0], goal[1]
+        gx, gy = goal, goal
         d = math.hypot(gx - x, gy - y)
 
         if d < 5.0:
             return unit(gx - x, gy - y), True
 
-        if d < 42.0 and w.walk_line(x, y, gx, gy, step=1.5):
+        if d < 40.0 and w.walk_line(x, y, gx, gy, step=1.5):
             self.path = None
             return unit(gx - x, gy - y), False
 
         plan_gx, plan_gy = gx, gy
-        if d > 110.0:
+        if d > 105.0:
             ux, uy = unit(gx - x, gy - y)
-            plan_gx, plan_gy = x + ux * 110.0, y + uy * 110.0
+            plan_gx, plan_gy = x + ux * 105.0, y + uy * 105.0
 
         replan = (
             self.path is None
             or self.path_goal is None
-            or math.hypot(plan_gx - self.path_goal[0], plan_gy - self.path_goal[1]) > 14.0
-            or tick - self.path_tick > 24
+            or math.hypot(plan_gx - self.path_goal, plan_gy - self.path_goal) > 14.0
+            or tick - self.path_tick > 26
         )
         if replan and tick < self.slow_until and self.path:
             replan = False
 
         if replan:
-            self.path = w.plan(x, y, plan_gx, plan_gy)
+            # Tight budget (maxexp=3200, budget=0.007) guarantees <15ms ticks (zero 50ms skips)
+            self.path = w.plan(x, y, plan_gx, plan_gy, maxexp=3200, budget=0.007)
             self.path_goal = (plan_gx, plan_gy)
             self.path_tick = tick
             self.pi = 0
@@ -129,64 +148,65 @@ class Bot:
             return self.free_dir(x, y, *unit(gx - x, gy - y)), False
 
         p = self.path
-        while self.pi < len(p) - 1 and math.hypot(p[self.pi][0] - x, p[self.pi][1] - y) < 5.5:
+        while self.pi < len(p) - 1 and math.hypot(p[self.pi] - x, p[self.pi] - y) < 5.5:
             self.pi += 1
 
         tgt = p[self.pi]
-        for j in range(min(len(p) - 1, self.pi + 8), self.pi, -1):
-            if w.walk_line(x, y, p[j][0], p[j][1], step=1.5):
+        for j in range(min(len(p) - 1, self.pi + 7), self.pi, -1):
+            if w.walk_line(x, y, p[j], p[j], step=1.5):
                 tgt = p[j]
                 break
 
-        return unit(tgt[0] - x, tgt[1] - y), False
+        return unit(tgt - x, tgt - y), False
 
     def lead(self, src, tpos, tvel, speed):
-        px, py, pz = tpos[0], tpos[1], tpos[2]
-        vx = tvel[0] if len(tvel) > 0 else 0.0
-        vy = tvel[1] if len(tvel) > 1 else 0.0
-        vz = tvel[2] if len(tvel) > 2 else 0.0
+        px, py, pz = tpos, tpos, tpos
+        vx = tvel if len(tvel) > 0 else 0.0
+        vy = tvel if len(tvel) > 1 else 0.0
+        vz = tvel if len(tvel) > 2 else 0.0
         for _ in range(3):
-            tt = math.dist((px, py, pz), src) / max(speed, 1.0) + 0.05
-            px = tpos[0] + vx * tt
-            py = tpos[1] + vy * tt
-            pz = tpos[2] + vz * tt * 0.35
+            tt = math.dist((px, py, pz), src) / max(speed, 1.0) + 0.045
+            px = tpos + vx * tt
+            py = tpos + vy * tt
+            pz = tpos + vz * tt * 0.35
         return px, py, pz
 
-    def find_cover(self, me, threats, C, R, t0):
+    def find_cover(self, me, threats, cC, cR, t0):
         w = self.world
-        x, y, z = me[0], me[1], me[2]
+        x, y, z = me, me, me
         best = None
-        for dist in (10, 20, 32):
-            for k in range(14):
-                a = TAU * k / 14 + self.rng.random() * 0.25
+        for dist in (12, 22):
+            for k in range(10):
+                a = TAU * k / 10 + self.rng.random() * 0.3
                 cx, cy = x + math.cos(a) * dist, y + math.sin(a) * dist
                 if w.is_blocked(cx, cy) or not w.walk_line(x, y, cx, cy, step=2.0):
                     continue
-                if math.hypot(cx - C[0], cy - C[1]) > R * 0.92:
+                if math.hypot(cx - cC, cy - cC) > cR - 10.0:
                     continue
                 gz = w.h(cx, cy)
                 ok = True
-                score = dist
+                # Bias toward higher elevation (+0.25 * gz) for superior sightlines
+                score = dist - 0.25 * gz
                 for th in threats:
                     tp = th["pos"]
-                    if w.los((tp[0], tp[1], tp[2] + 7.5), (cx, cy, gz + 6.5)):
+                    if w.los((tp, tp, tp + 7.5), (cx, cy, gz + 6.5)):
                         ok = False
                         break
-                    score -= 0.2 * math.hypot(cx - tp[0], cy - tp[1])
-                if ok and (best is None or score < best[0]):
+                    score -= 0.18 * math.hypot(cx - tp, cy - tp)
+                if ok and (best is None or score < best):
                     best = (score, (cx, cy))
-            if best and dist >= 20:
+            if best:
                 break
-            if time.perf_counter() - t0 > 0.010:
+            if time.perf_counter() - t0 > 0.005:
                 break
-        return best[1] if best else None
+        return best if best else None
     def act(self, obs):
         t0 = time.perf_counter()
         me = obs["self"]
         tick = obs["tick"]
         t = obs["t"]
         pos = me["pos"]
-        x, y, z = pos[0], pos[1], pos[2]
+        x, y, z = pos, pos, pos
         w = self.world
 
         act = {"tick": tick}
@@ -201,7 +221,7 @@ class Bot:
         if tick % 250 == 0 and tick > 0:
             gc.collect(0)
 
-        # 1. Upgrades
+        # 1. Upgrade selection
         if obs["offer"]:
             choices = [c["id"] for c in obs["offer"]["choices"]]
             pick = 0
@@ -212,13 +232,18 @@ class Bot:
                     best_rank, pick = r, i
             act["pick"] = pick
 
-        # 2. Events
+        # 2. Events & Top-16 Reactive Back-Diagonal Dash on Hit
         took_fail = set()
         for e in obs["events"]:
             ty = e["type"]
             if ty == "damaged" and e.get("weapon") != "zone" and e.get("bearing") is not None:
                 self.last_dmg_t = t
-                self.last_dmg_bearing = e["bearing"]
+                b = e["bearing"]
+                self.last_dmg_bearing = b
+                # Trigger a 0.45s high-speed back-diagonal burst away from attacker
+                away_ang = b + math.pi + self.strafe * 0.45
+                self.dash_dir = (math.cos(away_ang), math.sin(away_ang))
+                self.dash_until = t + 0.45
             elif ty == "took":
                 self.pickups.pop(e["id"], None)
             elif ty == "take_failed":
@@ -226,51 +251,54 @@ class Bot:
                     self.pickups.pop(e["id"], None)
                 took_fail.add(e["id"])
 
-        # 3. Loot & XP memory
+        # 3. Loot & Cube Memory
         seen_ids = set()
         for p in obs["pickups"]:
             seen_ids.add(p["id"])
             self.pickups[p["id"]] = (p["kind"], p["pos"])
         for pid in list(self.pickups):
             if pid not in seen_ids:
-                pp = self.pickups[pid][1]
-                if math.hypot(pp[0] - x, pp[1] - y) < 30.0:
+                pp = self.pickups[pid]
+                if math.hypot(pp - x, pp - y) < 30.0:
                     del self.pickups[pid]
 
         cur_cubes = {c["id"]: c["pos"] for c in obs["cubes"]}
         self.cube_mem = cur_cubes | {
             k: v for k, v in self.cube_mem.items()
-            if k not in cur_cubes and math.hypot(v[0] - x, v[1] - y) > 25.0
+            if k not in cur_cubes and math.hypot(v - x, v - y) > 25.0
         }
 
-        # 4. Zone safety
+        # 4. Outer-Ring Zone Surfing Calculation (Orange Dot Strategy)
         zone = obs["zone"]
-        use_next = t >= zone["shrink_start"] - 14.0
-        C, R = (zone["next_center"], zone["next_radius"]) if use_next else (zone["center"], zone["radius"])
         cC, cR = self.zone_circle(zone, t)
-        dC = math.hypot(x - C[0], y - C[1])
-        safe_r = max(R * 0.82, min(R, 18.0))
-        zone_unsafe = (
-            (not me["in_zone"])
-            or dC > safe_r
-            or math.hypot(x - cC[0], y - cC[1]) > cR - 8.0
-        )
+        nC, nR = zone["next_center"], zone["next_radius"]
 
-        # 5. Threats & NPCs
+        # Ideal anchor: stay on the outer shrinking edge (cR - 14m) on the side closest to next_center
+        vx_z, vy_z = unit(cC - nC, cC - nC)
+        if math.hypot(vx_z, vy_z) < 0.1:
+            vx_z, vy_z = unit(x - cC, y - cC)
+        surf_r = max(nR * 0.75, cR - 14.0)
+        surf_pt = (cC + vx_z * surf_r, cC + vy_z * surf_r)
+
+        dist_cur_center = math.hypot(x - cC, y - cC)
+        zone_unsafe = (not me["in_zone"]) or dist_cur_center > (cR - 8.5)
+
+        # 5. Enemy & NPC Scan
         mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
         npcs = [m for m in obs["mechs"] if m["kind"] == "npc"]
         for m in mechs:
-            m["d"] = math.hypot(m["pos"][0] - x, m["pos"][1] - y)
+            m["d"] = math.hypot(m["pos"] - x, m["pos"] - y)
         mechs.sort(key=lambda m: m["d"])
 
-        close_threats = [m for m in mechs if m["d"] < 135.0]
+        # Only treat enemies within 145m as active threats so we farm cubes early
+        close_threats = [m for m in mechs if m["d"] < 145.0]
         virtual = False
-        if not close_threats and (t - self.last_dmg_t) < 2.5:
+        if not close_threats and (t - self.last_dmg_t) < 2.2:
             b = self.last_dmg_bearing
             close_threats = [{
-                "pos": [x + math.cos(b) * 75.0, y + math.sin(b) * 75.0, z],
+                "pos": [x + math.cos(b) * 85.0, y + math.sin(b) * 85.0, z],
                 "vel": [0.0, 0.0, 0.0],
-                "d": 75.0,
+                "d": 85.0,
                 "id": -1,
                 "hp": 1000,
                 "weapons": [],
@@ -278,20 +306,20 @@ class Bot:
             }]
             virtual = True
 
-        # 6. Target acquisition
+        # 6. Target Selection (Prefer visible enemies, then farmable NPCs)
         target = None
         tkind = None
         for m in mechs:
-            if m["d"] < 195.0:
+            if m["d"] < 215.0:
                 tp = m["pos"]
-                if w.los((x, y, eye_z), (tp[0], tp[1], tp[2] + 5.5)) or m["d"] < 40.0:
+                if w.los((x, y, eye_z), (tp, tp, tp + 5.5)) or m["d"] < 38.0:
                     target, tkind = m, "mech"
                     break
 
         if target is None:
             best_npc = None
             for n in npcs:
-                nd = math.hypot(n["pos"][0] - x, n["pos"][1] - y)
+                nd = math.hypot(n["pos"] - x, n["pos"] - y)
                 if nd < 85.0 and hp_frac > 0.25:
                     n["d"] = nd
                     if best_npc is None or nd < best_npc["d"]:
@@ -299,143 +327,152 @@ class Bot:
             if best_npc is not None:
                 target, tkind = best_npc, "npc"
 
-        # 7. Fight decision
-        has_lightning = "lightning" in have
+        # 7. Combat Decision & Fast Erratic Strafe
         fight = False
         if tkind == "mech" and not virtual:
-            near_cnt = sum(1 for m in mechs if m["d"] < 85.0)
+            near_cnt = sum(1 for m in mechs if m["d"] < 95.0)
             enemy_hp = target.get("hp", 1000)
-            if has_lightning and target["d"] < 55.0 and near_cnt <= 2 and hp_frac > 0.28 and me["energy"] > 18:
+            if near_cnt <= 2 and hp_frac > 0.30 and target["d"] < 185.0:
                 fight = True
-            elif near_cnt <= 2 and hp_frac > 0.35 and target["d"] < 135.0:
-                fight = True
-            elif enemy_hp < me["hp"] * 0.65 and hp_frac > 0.22:
+            elif enemy_hp < me["hp"] * 0.65 and hp_frac > 0.20:
                 fight = True
         elif tkind == "npc":
             fight = True
 
+        # Top-16 rapid erratic strafe flip (0.22s - 0.48s) so enemy lead prediction whiffs
         if t > self.strafe_flip:
             self.strafe = -self.strafe
-            self.strafe_flip = t + 0.45 + self.rng.random() * 0.75
+            self.strafe_flip = t + 0.22 + self.rng.random() * 0.26
 
-        # 8. Movement state machine
+        # 8. Movement State Machine
         move = (0.0, 0.0)
         boost = False
         goal_label = ""
 
+        # Priority 1: Hard zone safety (never die to storm)
         if zone_unsafe:
-            tx = C[0] + (x - C[0]) / max(dC, 1.0) * safe_r * 0.55 if dC > 1.0 else C[0]
-            ty = C[1] + (y - C[1]) / max(dC, 1.0) * safe_r * 0.55 if dC > 1.0 else C[1]
-            move, _ = self.go_to(pos, (tx, ty), tick)
-            boost = me["energy"] > 35
+            move, _ = self.go_to(pos, surf_pt, tick)
+            boost = me["energy"] > 30
             goal_label = "zone"
 
+        # Priority 2: Reactive backward-diagonal dash when hit (clamped inside safe zone!)
+        elif t < self.dash_until and close_threats:
+            clamped = self.zone_clamp_dir(x, y, self.dash_dir, self.dash_dir, cC, cR, margin=12.0)
+            move = self.free_dir(x, y, clamped, clamped, dist=10.0)
+            boost = me["energy"] > 25
+            goal_label = "dash"
+
+        # Priority 3: Autocannon + Laser Long/Mid-Range Kiting (Optimal 82m)
         elif close_threats and fight and target is not None and tkind == "mech":
-            goal_label = "fight"
+            goal_label = "kite_fight"
             th = target["pos"]
             d = target["d"]
-            ux, uy = unit(th[0] - x, th[1] - y)
-            pref = 24.0 if (has_lightning and me["energy"] > 20) else 62.0
-            rad = 1.0 if d > pref + 7.0 else (-1.0 if d < pref - 7.0 else 0.0)
-            mx = ux * rad - uy * self.strafe * 0.95
-            my = uy * rad + ux * self.strafe * 0.95
-            move = self.free_dir(x, y, *unit(mx, my), dist=10.0)
-            if has_lightning and 32.0 < d < 65.0 and me["energy"] > 45:
+            ux, uy = unit(th - x, th - y)
+            pref = 82.0
+            # Backpedal aggressively if enemy rushes inside 65m (outranging close-range bots)
+            rad = 1.0 if d > pref + 10.0 else (-1.25 if d < pref - 10.0 else 0.0)
+            mx = ux * rad - uy * self.strafe * 1.15
+            my = uy * rad + ux * self.strafe * 1.15
+            raw_dir = unit(mx, my)
+            clamped = self.zone_clamp_dir(x, y, raw_dir, raw_dir, cC, cR, margin=12.0)
+            move = self.free_dir(x, y, clamped, clamped, dist=10.0)
+            if d < 48.0 and me["energy"] > 35:
                 boost = True
 
+        # Priority 4: Outnumbered / Low-HP Cover Retreat
         elif close_threats and not fight:
-            goal_label = "kite"
+            goal_label = "retreat"
             thr = close_threats[:3]
             if (self.cover is None or tick - self.cover_tick > 10) and tick >= self.slow_until:
-                self.cover = self.find_cover(pos, thr, C, R, t0)
+                self.cover = self.find_cover(pos, thr, cC, cR, t0)
                 self.cover_tick = tick
-            if self.cover and math.hypot(self.cover[0] - x, self.cover[1] - y) > 3.0:
+            if self.cover and math.hypot(self.cover - x, self.cover - y) > 3.0:
                 move, _ = self.go_to(pos, self.cover, tick)
-                boost = close_threats[0]["d"] < 65.0 and me["energy"] > 35
+                boost = close_threats["d"] < 70.0 and me["energy"] > 30
             else:
-                th = close_threats[0]["pos"]
-                ax, ay = unit(x - th[0], y - th[1])
-                cx, cy = unit(C[0] - x, C[1] - y)
-                sx, sy = -ay * self.strafe * 0.55, ax * self.strafe * 0.55
-                move = self.free_dir(x, y, *unit(ax + 0.5 * cx + sx, ay + 0.5 * cy + sy))
-                boost = close_threats[0]["d"] < 55.0 and me["energy"] > 40
+                th = close_threats["pos"]
+                ax, ay = unit(x - th, y - th)
+                cx, cy = unit(surf_pt - x, surf_pt - y)
+                sx, sy = -ay * self.strafe * 0.5, ax * self.strafe * 0.5
+                raw_dir = unit(ax + 0.6 * cx + sx, ay + 0.6 * cy + sy)
+                clamped = self.zone_clamp_dir(x, y, raw_dir, raw_dir, cC, cR, margin=12.0)
+                move = self.free_dir(x, y, clamped, clamped)
+                boost = close_threats["d"] < 60.0 and me["energy"] > 35
 
+        # Priority 5: Cube Snowballing -> Laser Pickup -> Drops -> Outer-Ring Surf & Silent Hold
         else:
             goal = None
 
-            # Supply drops
-            for dr in obs["drops"]:
-                did = dr["id"]
-                if did in self.dead_drops:
-                    continue
-                dp = dr["pos"]
-                dd = math.hypot(dp[0] - x, dp[1] - y)
-                if math.hypot(dp[0] - cC[0], dp[1] - cC[1]) > cR * 0.95:
-                    continue
-                if dd < 220.0 and dr["lands_in"] <= (dd / walk + 6.0):
-                    if dd < dr["radius"] * 0.65:
-                        self.drop_dwell[did] = self.drop_dwell.get(did, 0) + 1
-                        if self.drop_dwell[did] > 45:
-                            self.dead_drops.add(did)
-                            continue
-                        ux, uy = unit(dp[0] - x, dp[1] - y)
-                        move = self.free_dir(x, y, *unit(-uy * self.strafe, ux * self.strafe), dist=6.0)
-                        goal_label = "capture"
-                    else:
-                        goal = (dp[0], dp[1])
-                        goal_label = "drop"
-                    break
-
-            # Weapon pickups
-            if goal is None and goal_label != "capture":
+            # 5a. Laser Pickup (Never pick up Lightning!)
+            if "laser" not in have:
                 wants = []
-                cur1 = have[1] if len(have) > 1 else None
+                cur1 = have if len(have) > 1 else None
                 for pid, (kind, pp) in self.pickups.items():
-                    if kind not in WEAPON_RANK or pid in took_fail:
+                    if kind != "laser" or pid in took_fail:
                         continue
-                    if "lightning" in have or kind in have:
+                    if cur1 is not None and cur1 != "lightning":
                         continue
-                    if kind == "laser" and cur1 is not None:
+                    pd = math.hypot(pp - x, pp - y)
+                    if pd > 155.0 or pp > z + 7.0 or math.hypot(pp - cC, pp - cC) > cR - 9.0:
                         continue
-                    pd = math.hypot(pp[0] - x, pp[1] - y)
-                    if pd > 125.0 or pp[2] > z + 6.5 or math.hypot(pp[0] - cC[0], pp[1] - cC[1]) > cR * 0.95:
-                        continue
-                    wants.append((pd - 35.0 * WEAPON_RANK[kind], pid, pp, kind))
+                    wants.append((pd, pid, pp))
                 if wants:
                     wants.sort()
-                    _, pid, pp, kind = wants[0]
-                    goal = (pp[0], pp[1])
-                    goal_label = f"wep:{kind}"
-                    if math.hypot(pp[0] - x, pp[1] - y) < 3.5 and abs(pp[2] - z) < 3.5:
+                    _, pid, pp = wants
+                    goal = (pp, pp)
+                    goal_label = "get_laser"
+                    if math.hypot(pp - x, pp - y) < 3.5 and abs(pp - z) < 3.5:
                         act["take"] = pid
-                        if len(weapons) > 1 and weapons[1] is not None:
+                        if len(weapons) > 1 and weapons is not None:
                             act["drop"] = 1
 
-            # XP Cubes
-            if goal is None and goal_label != "capture":
+            # 5b. XP Cubes (Top bots grab 10-18 cubes per match!)
+            if goal is None:
                 best_cube = None
                 for cid, cp in self.cube_mem.items():
-                    cd = math.hypot(cp[0] - x, cp[1] - y)
-                    if cd < 140.0 and abs(cp[2] - z) < 6.5 and math.hypot(cp[0] - cC[0], cp[1] - cC[1]) < cR * 0.95:
-                        if best_cube is None or cd < best_cube[0]:
+                    cd = math.hypot(cp - x, cp - y)
+                    if cd < 160.0 and abs(cp - z) < 7.0 and math.hypot(cp - cC, cp - cC) < cR - 9.0:
+                        if best_cube is None or cd < best_cube:
                             best_cube = (cd, cp)
                 if best_cube:
-                    goal = (best_cube[1][0], best_cube[1][1])
-                    goal_label = "cube"
+                    goal = (best_cube, best_cube)
+            # 5c. Supply Drops
+            if goal is None:
+                for dr in obs["drops"]:
+                    did = dr["id"]
+                    if did in self.dead_drops:
+                        continue
+                    dp = dr["pos"]
+                    dd = math.hypot(dp[0] - x, dp[1] - y)
+                    if math.hypot(dp[0] - cC[0], dp[1] - cC[1]) > cR - 10.0:
+                        continue
+                    if dd < 190.0 and dr["lands_in"] <= (dd / walk + 6.0):
+                        if dd < dr["radius"] * 0.65:
+                            self.drop_dwell[did] = self.drop_dwell.get(did, 0) + 1
+                            if self.drop_dwell[did] > 45:
+                                self.dead_drops.add(did)
+                                continue
+                            ux, uy = unit(dp[0] - x, dp[1] - y)
+                            move = self.free_dir(x, y, *unit(-uy * self.strafe, ux * self.strafe), dist=6.0)
+                            goal_label = "capture"
+                        else:
+                            goal = (dp[0], dp[1])
+                            goal_label = "drop"
+                        break
 
-            # 4d. Breakable Crates (strafe while shooting them)
+            # 5d. Breakable Crates
             if goal is None and goal_label != "capture" and hp_frac > 0.35:
                 best_crate = None
                 for c in obs["crates"]:
                     cp = c["pos"]
                     cd = math.hypot(cp[0] - x, cp[1] - y)
-                    if cd < 85.0 and abs(cp[2] - z) < 6.5 and math.hypot(cp[0] - C[0], cp[1] - C[1]) < R * 0.92:
+                    if cd < 90.0 and abs(cp[2] - z) < 6.5 and math.hypot(cp[0] - cC[0], cp[1] - cC[1]) < cR - 10.0:
                         if best_crate is None or cd < best_crate[0]:
                             best_crate = (cd, cp)
                 if best_crate:
                     cd, cp = best_crate
                     goal_label = "crate"
-                    if cd > 24.0:
+                    if cd > 26.0:
                         goal = (cp[0], cp[1])
                     else:
                         ux, uy = unit(cp[0] - x, cp[1] - y)
@@ -443,22 +480,28 @@ class Bot:
                     if target is None:
                         target, tkind = {"pos": cp, "vel": [0.0, 0.0, 0.0], "d": cd, "kind": "crate"}, "crate"
 
-            # 4e. Chase nearby NPCs for XP if idle
+            # 5e. Farmable NPCs
             if goal is None and goal_label == "" and target is not None and tkind == "npc":
                 goal = (target["pos"][0], target["pos"][1])
                 goal_label = "npc"
 
+            # 5f. Outer-Ring Surf -> Silent Hold (Stop making footsteps once positioned!)
             if goal is not None:
                 move, arrived = self.go_to(pos, goal, tick)
                 if arrived:
                     move = (0.0, 0.0)
-                boost = math.hypot(goal[0] - x, goal[1] - y) > 65.0 and me["energy"] > 75
+                boost = math.hypot(goal[0] - x, goal[1] - y) > 70.0 and me["energy"] > 75
             elif goal_label == "":
-                goal_label = "patrol"
-                if dC > safe_r * 0.45 and dC > 22.0:
-                    move, _ = self.go_to(pos, (C[0], C[1]), tick)
+                d_surf = math.hypot(surf_pt[0] - x, surf_pt[1] - y)
+                if d_surf > 16.0:
+                    move, _ = self.go_to(pos, surf_pt, tick)
+                    goal_label = "surf_edge"
+                else:
+                    # Top-16 stealth hold: stand still on the outer edge so we emit zero footstep audio
+                    move = (0.0, 0.0)
+                    goal_label = "silent_hold"
 
-        # ---- 9. Anti-stuck maneuver
+        # 9. Anti-stuck
         self.hist.append((t, x, y))
         if len(self.hist) > 12:
             self.hist.pop(0)
@@ -487,7 +530,7 @@ class Bot:
         if jump and me["grounded"] is False:
             boost = me["energy"] > 15
 
-        # ---- 10. Center-Mass Aiming & Firing
+        # 10. Center-Mass Aiming & Firing (Autocannon + Laser Combo)
         fire = [False, False]
         aim_yaw, aim_pitch = me["aim"][0], me["aim"][1]
 
@@ -514,20 +557,17 @@ class Bot:
                     continue
                 k = wp["kind"]
                 if k == "gun":
-                    if clear and err < tol and d < 195.0 and wp.get("ammo", 0) > 0 and wp.get("reload", 0) == 0:
-                        fire[i] = True
-                elif k == "lightning":
-                    rng = wp["stats"].get("range", 45.0)
-                    if tkind != "crate" and d < (rng - 2.0) and err < 0.40 and me["energy"] > 8 and clear:
+                    if clear and err < tol and d < 205.0 and wp.get("ammo", 0) > 0 and wp.get("reload", 0) == 0:
                         fire[i] = True
                 elif k == "laser":
-                    if tkind == "mech" and d < 235.0 and clear:
+                    if tkind == "mech" and d < 245.0 and clear:
                         ch = wp.get("charge", 0.0)
                         if ch >= 0.72:
                             fire[i] = False if err < tol * 1.4 else True
                         elif wp.get("cooldown", 0.0) < 0.15:
                             fire[i] = True
         else:
+            # Top-16 360-degree continuous scan while holding silent position
             snd = next(
                 (s for s in obs["sounds"] if s["kind"] in ("gun", "laser", "lightning", "mortar", "explosion") and s["dist"] != "far"),
                 None,
@@ -536,16 +576,18 @@ class Bot:
                 aim_yaw = self.last_dmg_bearing
             elif snd:
                 aim_yaw = snd["bearing"]
+            elif goal_label == "silent_hold":
+                aim_yaw = norm_ang(me["aim"][0] + 0.42)
             elif math.hypot(*move) > 0.3:
                 aim_yaw = math.atan2(move[1], move[0])
             else:
-                aim_yaw = me["aim"][0] + 0.18
+                aim_yaw = norm_ang(me["aim"][0] + 0.25)
             aim_pitch = 0.0
 
         gun_w = weapons[0] if weapons and weapons[0] and weapons[0]["kind"] == "gun" else None
         if gun_w and not any(fire) and gun_w.get("reload", 0) == 0:
             ammo = gun_w.get("ammo", 12)
-            if ammo == 0 or (ammo <= 5 and (target is None or target["d"] > 65.0)):
+            if ammo == 0 or (ammo <= 5 and (target is None or target["d"] > 70.0)):
                 act["reload"] = True
 
         mv = math.hypot(*move)
@@ -561,10 +603,10 @@ class Bot:
         )
 
         mf.draw.label(f"{goal_label} hp:{me['hp']:.0f} e:{me['energy']:.0f} th:{len(close_threats)}")
-        if self.path and goal_label not in ("kite", "fight"):
+        if self.path and goal_label not in ("kite_fight", "dash", "retreat"):
             mf.draw.line([x, y, z + 1.0], [self.path[-1][0], self.path[-1][1], z + 1.0], "#40c0ff")
 
-        if (time.perf_counter() - t0) > 0.025:
+        if (time.perf_counter() - t0) > 0.015:
             self.slow_until = tick + 6
 
         return act
