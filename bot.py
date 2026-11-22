@@ -1,4 +1,3 @@
-#w comment
 import gc
 import math
 import os
