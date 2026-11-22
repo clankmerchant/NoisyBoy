@@ -1,8 +1,10 @@
 package mech
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"sort"
 )
 
@@ -94,6 +96,7 @@ type Brain struct {
 	notPractice        bool
 	startAlive, kills  int
 	otherDead          int
+	detectUntil        float64 // NoisyBoy: practice/FFA is decided only before the first shrink
 	stickID            int
 	stickAt, loseAt    float64
 }
@@ -309,7 +312,9 @@ func (b *Brain) observe(o *Obs) {
 				}
 			}
 		case "kill":
-			b.kills++
+			if e.Target >= 0 && e.Target < 16 { // NoisyBoy: mechs only (ids 0-15), not drones or crates
+				b.kills++
+			}
 			delete(b.tracks, e.Target)
 		}
 	}
@@ -317,14 +322,24 @@ func (b *Brain) observe(o *Obs) {
 	if !b.baseSet {
 		b.base, b.baseSet = b.P, true
 		b.startAlive = o.Alive
+		// NoisyBoy: the zone can't kill anyone before the first shrink, so a death we didn't cause
+		// before then means a real free-for-all. After it, practice house bots die to the zone too,
+		// which used to flip practice into FFA mode for the rest of the match.
+		b.detectUntil = o.Zone.ShrinkStart
+		if b.detectUntil <= 0 {
+			b.detectUntil = 60
+		}
 	}
-	if b.startAlive-o.Alive-b.kills > 0 {
-		b.otherDead++
-	} else {
-		b.otherDead = 0
-	}
-	if b.otherDead >= 5 {
-		b.notPractice = true
+	if now < b.detectUntil && !b.notPractice {
+		if b.startAlive-o.Alive-b.kills > 0 {
+			b.otherDead++
+		} else {
+			b.otherDead = 0
+		}
+		if b.otherDead >= 5 {
+			b.notPractice = true
+			fmt.Fprintf(os.Stderr, "t=%.1f: deaths we did not cause before the first shrink: FFA mode\n", now)
+		}
 	}
 	if on := b.base.Practice && !b.notPractice && now > 20; on != b.pracOn {
 		b.pracOn = on
